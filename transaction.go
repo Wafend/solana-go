@@ -20,6 +20,7 @@ package solana
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"sort"
 
@@ -31,6 +32,18 @@ import (
 
 	"github.com/gagliardetto/solana-go/text"
 )
+
+// VersionedTransaction represents a versioned transaction (v0+) with proper serialization
+type VersionedTransaction struct {
+	// A list of base-58 encoded signatures applied to the transaction.
+	// The list is always of length `message.header.numRequiredSignatures` and not empty.
+	// The signature at index `i` corresponds to the public key at index
+	// `i` in `message.account_keys`. The first one is used as the transaction id.
+	Signatures []Signature `json:"signatures"`
+
+	// Defines the content of the transaction.
+	Message Message `json:"message"`
+}
 
 type Transaction struct {
 	// A list of base-58 encoded signatures applied to the transaction.
@@ -165,6 +178,9 @@ type TransactionOption interface {
 type transactionOptions struct {
 	payer         PublicKey
 	addressTables map[PublicKey]PublicKeySlice // [tablePubkey]addresses
+	nonceAccount  PublicKey                    // durable nonce account
+	nonceAuth     PublicKey                    // nonce authority
+	nonceValue    Hash                         // nonce value to use as recentBlockhash
 }
 
 type transactionOptionFunc func(opts *transactionOptions)
@@ -179,6 +195,21 @@ func TransactionPayer(payer PublicKey) TransactionOption {
 
 func TransactionAddressTables(tables map[PublicKey]PublicKeySlice) TransactionOption {
 	return transactionOptionFunc(func(opts *transactionOptions) { opts.addressTables = tables })
+}
+
+// TransactionDurableNonce sets the durable nonce account and authority for v0 transactions
+func TransactionDurableNonce(nonceAccount, nonceAuthority PublicKey) TransactionOption {
+	return transactionOptionFunc(func(opts *transactionOptions) {
+		opts.nonceAccount = nonceAccount
+		opts.nonceAuth = nonceAuthority
+	})
+}
+
+// TransactionWithNonceValue sets the nonce value to use as recentBlockhash for durable nonce transactions
+func TransactionWithNonceValue(nonceValue Hash) TransactionOption {
+	return transactionOptionFunc(func(opts *transactionOptions) {
+		opts.nonceValue = nonceValue
+	})
 }
 
 var debugNewTransaction = false
@@ -217,6 +248,69 @@ func (builder *TransactionBuilder) WithOpt(opt TransactionOption) *TransactionBu
 func (builder *TransactionBuilder) SetFeePayer(feePayer PublicKey) *TransactionBuilder {
 	builder.opts = append(builder.opts, TransactionPayer(feePayer))
 	return builder
+}
+
+// VersionedTransactionBuilder creates v0 transactions with LUT and durable nonce support
+type VersionedTransactionBuilder struct {
+	instructions    []Instruction
+	recentBlockHash Hash
+	opts            []TransactionOption
+}
+
+// NewVersionedTransactionBuilder creates a new v0 transaction builder.
+func NewVersionedTransactionBuilder() *VersionedTransactionBuilder {
+	return &VersionedTransactionBuilder{}
+}
+
+// AddInstruction adds the provided instruction to the v0 builder.
+func (builder *VersionedTransactionBuilder) AddInstruction(instruction Instruction) *VersionedTransactionBuilder {
+	builder.instructions = append(builder.instructions, instruction)
+	return builder
+}
+
+// SetRecentBlockHash sets the recent blockhash for the v0 builder.
+func (builder *VersionedTransactionBuilder) SetRecentBlockHash(recentBlockHash Hash) *VersionedTransactionBuilder {
+	builder.recentBlockHash = recentBlockHash
+	return builder
+}
+
+// WithOpt adds a TransactionOption to the v0 builder.
+func (builder *VersionedTransactionBuilder) WithOpt(opt TransactionOption) *VersionedTransactionBuilder {
+	builder.opts = append(builder.opts, opt)
+	return builder
+}
+
+// SetFeePayer sets the transaction fee payer for v0 transactions.
+func (builder *VersionedTransactionBuilder) SetFeePayer(feePayer PublicKey) *VersionedTransactionBuilder {
+	builder.opts = append(builder.opts, TransactionPayer(feePayer))
+	return builder
+}
+
+// SetAddressTables sets the address lookup tables for v0 transactions.
+func (builder *VersionedTransactionBuilder) SetAddressTables(tables map[PublicKey]PublicKeySlice) *VersionedTransactionBuilder {
+	builder.opts = append(builder.opts, TransactionAddressTables(tables))
+	return builder
+}
+
+// SetDurableNonce sets the durable nonce account and authority for v0 transactions.
+func (builder *VersionedTransactionBuilder) SetDurableNonce(nonceAccount, nonceAuthority PublicKey) *VersionedTransactionBuilder {
+	builder.opts = append(builder.opts, TransactionDurableNonce(nonceAccount, nonceAuthority))
+	return builder
+}
+
+// SetNonceValue sets the nonce value to use as recentBlockhash for durable nonce transactions.
+func (builder *VersionedTransactionBuilder) SetNonceValue(nonceValue Hash) *VersionedTransactionBuilder {
+	builder.opts = append(builder.opts, TransactionWithNonceValue(nonceValue))
+	return builder
+}
+
+// Build builds and returns a *VersionedTransaction.
+func (builder *VersionedTransactionBuilder) Build() (*VersionedTransaction, error) {
+	return NewVersionedTransaction(
+		builder.instructions,
+		builder.recentBlockHash,
+		builder.opts...,
+	)
 }
 
 // Build builds and returns a *Transaction.
@@ -476,6 +570,90 @@ func NewTransaction(instructions []Instruction, recentBlockHash Hash, opts ...Tr
 	}, nil
 }
 
+// NewVersionedTransaction creates a new v0 transaction, forcing MessageV0 when LUTs are present or requested.
+// Supports durable nonce by placing AdvanceNonceAccount first and using nonce value as recentBlockhash.
+func NewVersionedTransaction(instructions []Instruction, recentBlockHash Hash, opts ...TransactionOption) (*VersionedTransaction, error) {
+	if len(instructions) == 0 {
+		return nil, fmt.Errorf("requires at-least one instruction to create a transaction")
+	}
+
+	options := transactionOptions{}
+	for _, opt := range opts {
+		opt.apply(&options)
+	}
+
+	// Force v0 message for versioned transactions
+	var finalInstructions []Instruction
+
+	// If durable nonce is specified, add AdvanceNonceAccount instruction first
+	if !options.nonceAccount.IsZero() && !options.nonceAuth.IsZero() {
+		// Create the AdvanceNonceAccount instruction manually to avoid import cycle
+		// AdvanceNonceAccount instruction format:
+		// Program: SystemProgramID
+		// Accounts: [WRITE] nonceAccount, [] recentBlockhashesSysvar, [SIGNER] nonceAuthority
+		// Data: 4 bytes (instruction type for AdvanceNonceAccount)
+
+		// Create AdvanceNonceAccount instruction data (4 bytes for instruction type)
+		instructionData := make([]byte, 4)
+		binary.LittleEndian.PutUint32(instructionData, 4) // Instruction_AdvanceNonceAccount = 4
+
+		advanceNonce := NewInstruction(
+			SystemProgramID,
+			AccountMetaSlice{
+				{PublicKey: options.nonceAccount, IsSigner: false, IsWritable: true},
+				{PublicKey: SysVarRecentBlockHashesPubkey, IsSigner: false, IsWritable: false},
+				{PublicKey: options.nonceAuth, IsSigner: true, IsWritable: false},
+			},
+			instructionData,
+		)
+
+		finalInstructions = append(finalInstructions, advanceNonce)
+	}
+
+	// Add the original instructions
+	finalInstructions = append(finalInstructions, instructions...)
+
+	// Use nonce value as recentBlockhash if provided, otherwise use provided recentBlockHash
+	blockhashToUse := recentBlockHash
+	if !options.nonceValue.IsZero() {
+		blockhashToUse = options.nonceValue
+	}
+
+	// Create the transaction with v0 message
+	legacyTx, err := NewTransaction(finalInstructions, blockhashToUse, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Force v0 message
+	legacyTx.Message.SetVersion(MessageVersionV0)
+
+	return &VersionedTransaction{
+		Signatures: legacyTx.Signatures,
+		Message:    legacyTx.Message,
+	}, nil
+}
+
+// NewVersionedTransactionWithLUT creates a v0 transaction with address lookup tables
+func NewVersionedTransactionWithLUT(instructions []Instruction, recentBlockHash Hash, addressTables map[PublicKey]PublicKeySlice) (*VersionedTransaction, error) {
+	return NewVersionedTransaction(instructions, recentBlockHash, TransactionAddressTables(addressTables))
+}
+
+// NewVersionedTransactionWithDurableNonce creates a v0 transaction with durable nonce support
+func NewVersionedTransactionWithDurableNonce(instructions []Instruction, nonceValue Hash, nonceAccount, nonceAuthority PublicKey) (*VersionedTransaction, error) {
+	return NewVersionedTransaction(instructions, Hash{}, // recentBlockHash is ignored when nonceValue is provided
+		TransactionDurableNonce(nonceAccount, nonceAuthority),
+		TransactionWithNonceValue(nonceValue))
+}
+
+// NewVersionedTransactionWithLUTAndNonce creates a v0 transaction with both LUT and durable nonce support
+func NewVersionedTransactionWithLUTAndNonce(instructions []Instruction, nonceValue Hash, nonceAccount, nonceAuthority PublicKey, addressTables map[PublicKey]PublicKeySlice) (*VersionedTransaction, error) {
+	return NewVersionedTransaction(instructions, Hash{}, // recentBlockHash is ignored when nonceValue is provided
+		TransactionDurableNonce(nonceAccount, nonceAuthority),
+		TransactionWithNonceValue(nonceValue),
+		TransactionAddressTables(addressTables))
+}
+
 type privateKeyGetter func(key PublicKey) *PrivateKey
 
 func (tx *Transaction) MarshalBinary() ([]byte, error) {
@@ -572,6 +750,96 @@ func (tx *Transaction) Sign(getter privateKeyGetter) (out []Signature, err error
 		}
 	}
 	return tx.PartialSign(getter)
+}
+
+// VersionedTransaction methods
+
+// MarshalBinary serializes the versioned transaction with the 0x80 prefix
+func (vtx *VersionedTransaction) MarshalBinary() ([]byte, error) {
+	messageContent, err := vtx.Message.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode vtx.Message to binary: %w", err)
+	}
+
+	var signatureCount []byte
+	bin.EncodeCompactU16Length(&signatureCount, len(vtx.Signatures))
+	output := make([]byte, 0, len(signatureCount)+len(signatureCount)*64+len(messageContent))
+	output = append(output, signatureCount...)
+	for _, sig := range vtx.Signatures {
+		output = append(output, sig[:]...)
+	}
+	output = append(output, messageContent...)
+
+	return output, nil
+}
+
+// MarshalWithEncoder implements binary encoding for VersionedTransaction
+func (vtx VersionedTransaction) MarshalWithEncoder(encoder *bin.Encoder) error {
+	out, err := vtx.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	return encoder.WriteBytes(out, false)
+}
+
+// ToBase64 returns the base64 encoded versioned transaction
+func (vtx VersionedTransaction) ToBase64() (string, error) {
+	out, err := vtx.MarshalBinary()
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(out), nil
+}
+
+// MustToBase64 returns the base64 encoded versioned transaction, panicking on error
+func (vtx VersionedTransaction) MustToBase64() string {
+	out, err := vtx.ToBase64()
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+// PartialSign signs the versioned transaction with available keys
+func (vtx *VersionedTransaction) PartialSign(getter privateKeyGetter) (out []Signature, err error) {
+	messageContent, err := vtx.Message.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("unable to encode message for signing: %w", err)
+	}
+	signerKeys := vtx.Message.signerKeys()
+
+	// Ensure that the transaction has the correct number of signatures initialized
+	if len(vtx.Signatures) == 0 {
+		// Initialize the Signatures slice to the correct length if it's empty
+		vtx.Signatures = make([]Signature, len(signerKeys))
+	} else if len(vtx.Signatures) != len(signerKeys) {
+		// Return an error if the current length of the Signatures slice doesn't match the expected number
+		return nil, fmt.Errorf("invalid signatures length, expected %d, actual %d", len(signerKeys), len(vtx.Signatures))
+	}
+
+	for i, key := range signerKeys {
+		privateKey := getter(key)
+		if privateKey != nil {
+			s, err := privateKey.Sign(messageContent)
+			if err != nil {
+				return nil, fmt.Errorf("failed to signed with key %q: %w", key.String(), err)
+			}
+			// Directly assign the signature to the corresponding position in the transaction's signature slice
+			vtx.Signatures[i] = s
+		}
+	}
+	return vtx.Signatures, nil
+}
+
+// Sign signs the versioned transaction with all required keys
+func (vtx *VersionedTransaction) Sign(getter privateKeyGetter) (out []Signature, err error) {
+	signerKeys := vtx.Message.signerKeys()
+	for _, key := range signerKeys {
+		if getter(key) == nil {
+			return nil, fmt.Errorf("signer key %q not found. Ensure all the signer keys are in the vault", key.String())
+		}
+	}
+	return vtx.PartialSign(getter)
 }
 
 func (tx *Transaction) EncodeTree(encoder *text.TreeEncoder) (int, error) {

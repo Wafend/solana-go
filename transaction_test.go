@@ -350,3 +350,60 @@ func BenchmarkTransactionVerifySignatures(b *testing.B) {
 		tx.VerifySignatures()
 	}
 }
+
+func TestVersionedTransaction(t *testing.T) {
+	// Test creating a v0 transaction with durable nonce
+	nonceAccount := MustPublicKeyFromBase58("2HAW1rDF8AmkT1kZgtuoPfX2kRj9n1XsasbPY3gZ4z3m")
+	nonceAuthority := MustPublicKeyFromBase58("11111111111111111111111111111112")
+	nonceValue := Hash{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
+
+	// Create a simple instruction
+	instruction := NewInstruction(
+		SystemProgramID,
+		AccountMetaSlice{
+			{PublicKey: MustPublicKeyFromBase58("11111111111111111111111111111111"), IsSigner: true, IsWritable: true},
+		},
+		[]byte{0, 1, 2, 3},
+	)
+
+	// Create v0 transaction with durable nonce
+	vtx, err := NewVersionedTransaction(
+		[]Instruction{instruction},
+		Hash{}, // recentBlockHash will be replaced by nonceValue
+		TransactionDurableNonce(nonceAccount, nonceAuthority),
+		TransactionWithNonceValue(nonceValue),
+	)
+
+	require.NoError(t, err)
+	assert.NotNil(t, vtx)
+	assert.Equal(t, MessageVersionV0, vtx.Message.GetVersion())
+
+	// Verify AdvanceNonceAccount instruction is added
+	assert.Len(t, vtx.Message.Instructions, 2)
+	assert.Equal(t, MessageVersionV0, vtx.Message.GetVersion())
+}
+
+func TestVersionedTransactionBuilder(t *testing.T) {
+	// Test the v0 transaction builder
+	builder := NewVersionedTransactionBuilder().
+		SetRecentBlockHash(Hash{1, 2, 3}).
+		SetFeePayer(MustPublicKeyFromBase58("11111111111111111111111111111111")).
+		SetDurableNonce(
+			MustPublicKeyFromBase58("2HAW1rDF8AmkT1kZgtuoPfX2kRj9n1XsasbPY3gZ4z3m"),
+			MustPublicKeyFromBase58("11111111111111111111111111111112"),
+		).
+		SetNonceValue(Hash{4, 5, 6}).
+		AddInstruction(NewInstruction(
+			SystemProgramID,
+			AccountMetaSlice{
+				{PublicKey: MustPublicKeyFromBase58("11111111111111111111111111111111"), IsSigner: true, IsWritable: true},
+			},
+			[]byte{0, 1, 2, 3},
+		))
+
+	vtx, err := builder.Build()
+	require.NoError(t, err)
+	assert.NotNil(t, vtx)
+	assert.Equal(t, MessageVersionV0, vtx.Message.GetVersion())
+	assert.Equal(t, Hash{4, 5, 6}, vtx.Message.RecentBlockhash)
+}
